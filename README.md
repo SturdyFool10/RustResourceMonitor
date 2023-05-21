@@ -1,1 +1,2 @@
 # RustResourceMonitor
+This simple application will allow one to make a web client for monitoring system resources, such resources include: Operating System, Memory, and CPU, and this is accomplished asynchronously using a task based system, which allows for concurrency at its finest, meaning that resource utilization should be effecient and minimal for a desktop enviornment, the websocket will need to interpret json that the server will spit out once every half second or so
