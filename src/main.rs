@@ -64,11 +64,8 @@ macro_rules! async_listener {
     ($key:expr, $app:expr) => {{
         use crossterm::{
             event::{poll, read, Event, KeyCode},
-            Result,
         };
         use tokio::task::yield_now;
-
-        let stop_flag = Arc::clone(&$app.atomic_flag);
 
         // Create a future that waits for the key combination
         let key_future = async move {
@@ -269,7 +266,7 @@ async fn main() {
     //join all handles
     println!("All tasks are attempting to spool down... application will stop soon after...");
     for (index, handle) in handles.iter_mut().enumerate() {
-        handle.await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
         println!("Task ID: {} has stopped!", index);
     }
     println!("All tasks are stopped, terminating.....");
@@ -327,9 +324,9 @@ async fn send_updates_to_all(app: AppState) {
         drop(sys);
         let json = serde_json::to_string(&json).unwrap_or("{\"Error\": \"Could not parse struct to json\"}".to_owned());
         for (index, socket) in clients.iter_mut().enumerate() {
-            tokio::time::timeout(std::time::Duration::from_secs_f64(1.0 / 1000.), socket.send(json.clone())).await;
+            tokio::time::timeout(std::time::Duration::from_secs_f64(1.0 / 10.), socket.send(json.clone())).await;
         }
-        std::thread::sleep(std::time::Duration::from_secs_f64(5.25));
+        std::thread::sleep(std::time::Duration::from_secs_f64(0.25));
     }
 }
 async fn find_or_generate_config() -> Option<Value> {
