@@ -230,8 +230,17 @@ async fn main() {
     let config = find_or_generate_config().await.expect("Error loading config.");
     let mut _global_state = AppState::new();
     let global_state_C = _global_state.clone(); //since we are using move into an async function, and I do not want _global_state to move, we create a copy here that will move into the closure
+    let ip = match config["ServerIP"].as_str() {
+        Some(val) => {
+            val
+        }
+        None => {
+            println!("The config did not contain value ServerIP, listening to all interfaces instead!");
+            "0.0.0.0"
+        }
+    };
     let port = config["port"].as_f64().unwrap_or(3000.);
-    let addr = format!("0.0.0.0:{}", port.floor() as u64);
+    let addr = format!("{}:{}", ip, port.floor() as u64);
     let listener = TcpListener::bind(&addr).await.expect("Failed to bind address");
     let mut handles: Vec<tokio::task::JoinHandle<()>> = vec![
         tokio::spawn(poll_system(_global_state.clone())),
@@ -340,6 +349,7 @@ async fn find_or_generate_config() -> Option<Value> {
                 match tokio::fs::File::create(config_path).await {
                     Ok(mut f) => {
                         let json = json!({
+                            "ServerIP": "0.0.0.0",
                             "port": 3000
                         });
                         let json_bytes = serde_json::to_string_pretty(&json).unwrap();
