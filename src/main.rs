@@ -38,10 +38,6 @@ use tokio::{
         TcpStream
     },
     sync::Mutex as TokioMutex,
-    signal::windows::{
-        ctrl_c, 
-        CtrlC
-    },
     time::timeout, io::AsyncWriteExt
 };
 
@@ -50,6 +46,21 @@ use tokio_tungstenite::{
     WebSocketStream, tungstenite::Message
 };
 
+use std::time::Instant;
+
+macro_rules! time_lock_acquisition {
+    ($name:ident, $lock:expr, $threshold:expr) => {
+        {
+            let start_time = Instant::now();
+            let lock = $lock.lock().await;
+            let duration = start_time.elapsed();
+            if cfg!(debug_assertions) && duration >= $threshold {
+                println!("{} lock acquisition time: {:?}", stringify!($name), duration);
+            }
+            lock
+        }
+    };
+}
 
 macro_rules! check_stopped {
     ($app_state:expr) => {
@@ -181,6 +192,47 @@ impl SInfoJson {
             System: sys_inf
         }
     }
+
+    pub fn update(&mut self, sys: &System) {
+        self.CPUs.clear();
+        let cpus = sys.cpus();
+        cpus.iter().for_each(|cpu| {
+            let _CPU = CPU {
+                name: cpu.name().trim().to_owned(),
+                cpu_usage: cpu.cpu_usage(),
+                vendor_id: cpu.vendor_id().to_owned(),
+                brand: cpu.brand().trim().to_owned(),
+                frequency: cpu.frequency(),
+            };
+            self.CPUs.push(_CPU);
+        });
+
+        self.Network.clear();
+        for (name, data) in sys.networks() {
+            let network_interface = NetworkInterface {
+                name: name.to_owned(),
+                received: data.received(),
+                send: data.transmitted(),
+            };
+            self.Network.push(network_interface);
+        }
+
+        self.Memory.total_capacity = sys.total_memory();
+        self.Memory.used = sys.used_memory();
+        self.Memory.swap_capacity = sys.total_swap();
+        self.Memory.swap_used = sys.used_swap();
+
+        self.System.Name = sys.name().unwrap_or_else(|| "unknown".to_owned());
+        self.System.Hostname = sys.host_name().unwrap_or_else(|| "unknown".to_owned());
+        self.System.Kernel_Version = sys.kernel_version().unwrap_or_else(|| "unknown".to_owned());
+        self.System.OS_Version = sys.os_version().unwrap_or_else(|| "unknown".to_owned());
+    }
+
+    pub fn default() -> Self {
+        let sys = System::new_all();
+        SInfoJson::new(&sys)
+    }
+
     fn to_json(&self) -> String {
         serde_json::to_string(&self).unwrap()
     }
@@ -191,14 +243,14 @@ impl SInfoJson {
 //define app state as a struct, this will store all the information we need to have persist across tasks
 #[derive(Clone)]
 struct AppState {
-    sysinfo_instance: Arc<TokioMutex<System>>,
+    sysinfo_instance: Arc<TokioMutex<SInfoJson>>,
     atomic_flag: Arc<AtomicBool>,
     clients: Arc<TokioMutex<Vec<SplitPipeWebSocket>>>
 }
 
 impl AppState {
     pub fn new() -> Self {
-        let sysinfo_instance = Arc::new(TokioMutex::new(System::new_all()));
+        let sysinfo_instance = Arc::new(TokioMutex::new(SInfoJson::default()));
         let atomic_flag = Arc::new(AtomicBool::new(false));
         let cList = Arc::new(TokioMutex::new(Vec::<SplitPipeWebSocket>::new()));
         AppState {
@@ -216,15 +268,44 @@ impl AppState {
 }
 
 async fn poll_system(app: AppState) {
-    let system = app.sysinfo_instance.clone();
+    let mut system = System::new_all();
     loop {
         check_stopped!(app); //will break the loop if app.stop was called, this makes it rather easy to make all the threads stop
-        let mut sys = system.lock().await;
-        sys.refresh_all();
-        drop(sys);
+        {
+            system.refresh_all();
+            let mut sys = time_lock_acquisition!(SystemPoll, app.sysinfo_instance, std::time::Duration::from_micros(250));
+            sys.update(&system);
+        }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 }
+
+async fn handle_connections(app: AppState, listener: TcpListener) {
+    {
+        loop {
+            check_stopped!(app);
+    
+            // Set the maximum duration for waiting for a connection
+            let timeout_duration = std::time::Duration::from_secs_f64(2.);
+    
+            // Wait for a connection with a timeout
+            match timeout(timeout_duration, listener.accept()).await {
+                Ok(Ok((stream, _))) => {
+                    if let Ok(ws_stream) = accept_async(stream).await {
+                        tokio::spawn(handle_websocket(ws_stream, app.clone()));
+                    }
+                }
+                Ok(Err(err)) => {
+                    // Handle the error as needed
+                }
+                Err(_) => {
+                    // Timeout occurred, we don't really need to do anything as doing this is mostly for allowing graceful termination, rather than being a real issue
+                }
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let config = find_or_generate_config().await.expect("Error loading config.");
@@ -244,29 +325,7 @@ async fn main() {
     let listener = TcpListener::bind(&addr).await.expect("Failed to bind address");
     let mut handles: Vec<tokio::task::JoinHandle<()>> = vec![
         tokio::spawn(poll_system(_global_state.clone())),
-        tokio::spawn(async move {
-            loop {
-                check_stopped!(global_state_C);
-        
-                // Set the maximum duration for waiting for a connection
-                let timeout_duration = std::time::Duration::from_secs_f64(4.25);
-        
-                // Wait for a connection with a timeout
-                match timeout(timeout_duration, listener.accept()).await {
-                    Ok(Ok((stream, _))) => {
-                        if let Ok(ws_stream) = accept_async(stream).await {
-                            handle_websocket(ws_stream, global_state_C.clone()).await;
-                        }
-                    }
-                    Ok(Err(err)) => {
-                        // Handle the error as needed
-                    }
-                    Err(_) => {
-                        // Timeout occurred, we don't really need to do anything as doing this is mostly for allowing graceful termination, rather than being a real issue
-                    }
-                }
-            }
-        }),
+        tokio::spawn(handle_connections(_global_state.clone(), listener)),
         tokio::spawn(send_updates_to_all(_global_state.clone()))
     ];
     let mut global_state_C = _global_state.clone();
@@ -275,8 +334,15 @@ async fn main() {
     //join all handles
     println!("All tasks are attempting to spool down... application will stop soon after...");
     for (index, handle) in handles.iter_mut().enumerate() {
-        tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
-        println!("Task ID: {} has stopped!", index);
+        let val: Result<Result<(), tokio::task::JoinError>, tokio::time::error::Elapsed> = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+        match val {
+            Ok(_) => {
+                println!("Task ID: {} has stopped without issue!", index);
+            }
+            Err(_) => {
+                println!("Task ID: {} has been forcefully terminated, it took too long to stop.", {index});
+            }
+        }
     }
     println!("All tasks are stopped, terminating.....");
 }
@@ -298,8 +364,7 @@ async fn handle_websocket(ws_stream: tokio_tungstenite::WebSocketStream<tokio::n
 
     // Example: Echo back received messages
     let (mut write, mut read) = ws_stream.split();
-    let  mut clientList = app.clients.lock().await;
-    let id = clientList.len();
+    let mut clientList = time_lock_acquisition!(HandleSocketGetClients, app.clients, std::time::Duration::from_micros(250));
     clientList.push(SplitPipeWebSocket { write: write});
     drop(clientList);
     loop {
@@ -327,15 +392,16 @@ async fn handle_websocket(ws_stream: tokio_tungstenite::WebSocketStream<tokio::n
 async fn send_updates_to_all(app: AppState) {
     loop {
         check_stopped!(app);
-        let mut clients = app.clients.lock().await;
-        let sys = app.sysinfo_instance.lock().await;
-        let json = SInfoJson::new(&sys);
+        let mut clients = time_lock_acquisition!(UpdateGetClients, app.clients, std::time::Duration::from_micros(250));
+        let sys = time_lock_acquisition!(UpdateGetSystem, app.sysinfo_instance, std::time::Duration::from_micros(250));
+        let json = sys.to_json();
         drop(sys);
         let json = serde_json::to_string(&json).unwrap_or("{\"Error\": \"Could not parse struct to json\"}".to_owned());
         for (index, socket) in clients.iter_mut().enumerate() {
             tokio::time::timeout(std::time::Duration::from_secs_f64(1.0 / 10.), socket.send(json.clone())).await;
         }
-        std::thread::sleep(std::time::Duration::from_secs_f64(0.25));
+        drop(clients);
+        std::thread::sleep(std::time::Duration::from_secs_f64(0.20));
     }
 }
 async fn find_or_generate_config() -> Option<Value> {
